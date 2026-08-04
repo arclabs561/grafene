@@ -15,7 +15,14 @@ repository:
   delete_branch_on_merge: true
 
   topics:
+    - gnn
+    - graph-algorithms
+    - graph-learning
+    - graph-neural-networks
     - knowledge-graph
-    - rdf
+    - knowledge-graphs
+    - node2vec
     - pagerank
+    - rdf
     - rust
+    - temporal-graphs
