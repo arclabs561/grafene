@@ -55,6 +55,10 @@ use crate::EntityId;
 
 /// Return the top-n scored entities, sorted descending by score.
 ///
+/// Finite scores and infinities use [`f64::total_cmp`]; NaN scores sort last.
+/// Equal scores are ordered by entity ID, so the result does not depend on
+/// [`HashMap`] insertion or iteration order.
+///
 /// # Example
 ///
 /// ```
@@ -76,7 +80,12 @@ use crate::EntityId;
 #[must_use]
 pub fn top_n(scores: &HashMap<EntityId, f64>, n: usize) -> Vec<(EntityId, f64)> {
     let mut entries: Vec<(EntityId, f64)> = scores.iter().map(|(k, &v)| (k.clone(), v)).collect();
-    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        a.1.is_nan()
+            .cmp(&b.1.is_nan())
+            .then_with(|| b.1.total_cmp(&a.1))
+            .then_with(|| a.0.as_str().cmp(b.0.as_str()))
+    });
     entries.truncate(n);
     entries
 }
@@ -103,4 +112,56 @@ pub(crate) fn unique_neighbors_undirected(
 fn dedup_nodes(nodes: &mut Vec<NodeIndex>) {
     nodes.sort_unstable_by_key(|idx| idx.index());
     nodes.dedup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_n_breaks_equal_score_ties_by_entity_id() {
+        let permutations = [
+            [("z", 0.5), ("a", 0.5), ("m", 0.5)],
+            [("m", 0.5), ("z", 0.5), ("a", 0.5)],
+            [("a", 0.5), ("m", 0.5), ("z", 0.5)],
+        ];
+
+        for input in permutations {
+            let scores: HashMap<_, _> = input
+                .into_iter()
+                .map(|(id, score)| (EntityId::from(id), score))
+                .collect();
+            let ids: Vec<_> = top_n(&scores, 3)
+                .into_iter()
+                .map(|(id, _)| id.into_string())
+                .collect();
+            assert_eq!(ids, ["a", "m", "z"]);
+        }
+    }
+
+    #[test]
+    fn top_n_uses_a_total_score_order() {
+        let scores = HashMap::from([
+            (EntityId::from("negative_infinity"), f64::NEG_INFINITY),
+            (EntityId::from("negative_zero"), -0.0),
+            (EntityId::from("positive_zero"), 0.0),
+            (EntityId::from("infinity"), f64::INFINITY),
+            (EntityId::from("nan"), f64::NAN),
+        ]);
+
+        let ids: Vec<_> = top_n(&scores, scores.len())
+            .into_iter()
+            .map(|(id, _)| id.into_string())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "infinity",
+                "positive_zero",
+                "negative_zero",
+                "negative_infinity",
+                "nan"
+            ]
+        );
+    }
 }

@@ -59,7 +59,8 @@ pub use dataset::{Dataset, InternedDataset, Vocab};
 pub use filter::FilterIndex;
 pub use metrics::{
     adjusted_mean_rank, hits_at_k, mean_rank, mean_reciprocal_rank, per_relation_mrr,
-    realistic_rank,
+    realistic_rank, try_adjusted_mean_rank, try_hits_at_k, try_mean_rank, try_mean_reciprocal_rank,
+    try_realistic_rank, MetricError,
 };
 pub use triple::{Triple, TripleIds};
 

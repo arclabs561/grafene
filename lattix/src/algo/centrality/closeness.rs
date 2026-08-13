@@ -26,13 +26,16 @@
 //! | Variant | Formula | Behavior |
 //! |---------|---------|----------|
 //! | **Harmonic** | Σ_{u≠v} 1/d(v,u) | Ignore unreachable (d=∞ → 0) |
-//! | **Wasserman-Faust** | (reachable - 1) / Σ d(v,u) | Only count reachable |
+//! | **Classic** | r / Σ d(v,u) | Reciprocal mean over `r` reachable peers |
+//! | **Wasserman-Faust** | [r/(n-1)] × [r/Σ d(v,u)] | Downweight small components |
 //!
-//! This implementation uses **harmonic centrality** for robustness.
+//! This implementation uses **harmonic centrality** by default. Classic mode
+//! uses the Wasserman-Faust factor when normalization is enabled.
 //!
 //! # Normalization
 //!
-//! Harmonic centrality is normalized by dividing by (n-1):
+//! Harmonic centrality is normalized by dividing by (n-1). For classic
+//! closeness, normalization applies the reachable fraction `r/(n-1)`:
 //!
 //! ```text
 //! C_H_norm(v) = C_H(v) / (n - 1)
@@ -50,9 +53,10 @@ use std::collections::{HashMap, VecDeque};
 /// Configuration for closeness centrality.
 #[derive(Debug, Clone, Copy)]
 pub struct ClosenessConfig {
-    /// Normalize scores to [0, 1] range.
+    /// Normalize harmonic scores by `n - 1`, or apply the
+    /// Wasserman-Faust reachable-fraction correction in classic mode.
     pub normalized: bool,
-    /// Treat graph as undirected.
+    /// Treat graph as undirected. Directed mode follows outgoing edges.
     pub undirected: bool,
     /// Use harmonic mean (recommended for disconnected graphs).
     pub harmonic: bool,
@@ -71,6 +75,7 @@ impl Default for ClosenessConfig {
 /// Compute closeness centrality for all nodes.
 ///
 /// Uses harmonic centrality by default, which handles disconnected graphs.
+/// Directed scores use outward distances from each node.
 ///
 /// # Complexity
 ///
@@ -113,7 +118,7 @@ pub fn closeness_centrality(
     for source in graph.node_indices() {
         let distances = bfs_distances(graph, source, config.undirected);
 
-        let closeness = if config.harmonic {
+        let normalized_closeness = if config.harmonic {
             // Harmonic: Σ 1/d(v,u) for all reachable u
             let sum: f64 = distances
                 .iter()
@@ -121,9 +126,13 @@ pub fn closeness_centrality(
                 .filter(|(i, &d)| *i != source.index() && d > 0)
                 .map(|(_, &d)| 1.0 / d as f64)
                 .sum();
-            sum
+            if config.normalized {
+                sum / (n - 1) as f64
+            } else {
+                sum
+            }
         } else {
-            // Classic: (n-1) / Σ d(v,u)
+            // Classic: reachable / Σ d(v,u)
             let reachable: Vec<_> = distances
                 .iter()
                 .enumerate()
@@ -134,14 +143,14 @@ pub fn closeness_centrality(
                 0.0
             } else {
                 let total_dist: i32 = reachable.iter().map(|(_, &d)| d).sum();
-                (reachable.len() as f64) / (total_dist as f64)
+                let reachable_count = reachable.len() as f64;
+                let classic = reachable_count / f64::from(total_dist);
+                if config.normalized {
+                    classic * reachable_count / (n - 1) as f64
+                } else {
+                    classic
+                }
             }
-        };
-
-        let normalized_closeness = if config.normalized {
-            closeness / (n - 1) as f64
-        } else {
-            closeness
         };
 
         let entity = &graph[source];
@@ -280,5 +289,110 @@ mod tests {
                 "Complete graph should have max closeness: {name}={score}"
             );
         }
+    }
+
+    fn assert_score(scores: &HashMap<EntityId, f64>, node: &str, expected: f64) {
+        let actual = scores[node];
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{node}: expected {expected}, got {actual}"
+        );
+    }
+
+    fn classic_undirected(kg: &KnowledgeGraph) -> HashMap<EntityId, f64> {
+        closeness_centrality(
+            kg,
+            ClosenessConfig {
+                normalized: true,
+                undirected: true,
+                harmonic: false,
+            },
+        )
+    }
+
+    #[test]
+    fn classic_path_star_cycle_and_complete_match_oracles() {
+        let mut path = KnowledgeGraph::new();
+        path.add_triple(Triple::new("A", "rel", "B"));
+        path.add_triple(Triple::new("B", "rel", "C"));
+        path.add_triple(Triple::new("C", "rel", "D"));
+        let path_scores = classic_undirected(&path);
+        for (node, expected) in [("A", 0.5), ("B", 0.75), ("C", 0.75), ("D", 0.5)] {
+            assert_score(&path_scores, node, expected);
+        }
+
+        let mut star = KnowledgeGraph::new();
+        for leaf in ["A", "B", "C"] {
+            star.add_triple(Triple::new("Hub", "rel", leaf));
+        }
+        let star_scores = classic_undirected(&star);
+        assert_score(&star_scores, "Hub", 1.0);
+        for leaf in ["A", "B", "C"] {
+            assert_score(&star_scores, leaf, 3.0 / 5.0);
+        }
+
+        let mut cycle = KnowledgeGraph::new();
+        for (from, to) in [("A", "B"), ("B", "C"), ("C", "D"), ("D", "A")] {
+            cycle.add_triple(Triple::new(from, "rel", to));
+        }
+        let cycle_scores = classic_undirected(&cycle);
+        for node in ["A", "B", "C", "D"] {
+            assert_score(&cycle_scores, node, 3.0 / 4.0);
+        }
+
+        let mut complete = KnowledgeGraph::new();
+        for (from, to) in [
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("B", "C"),
+            ("B", "D"),
+            ("C", "D"),
+        ] {
+            complete.add_triple(Triple::new(from, "rel", to));
+        }
+        let complete_scores = classic_undirected(&complete);
+        for node in ["A", "B", "C", "D"] {
+            assert_score(&complete_scores, node, 1.0);
+        }
+    }
+
+    #[test]
+    fn classic_disconnected_scores_use_wasserman_faust_scaling() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+        kg.add_triple(Triple::new("B", "rel", "C"));
+        kg.add_triple(Triple::new("D", "rel", "E"));
+
+        let scores = classic_undirected(&kg);
+        for (node, expected) in [
+            ("A", 1.0 / 3.0),
+            ("B", 0.5),
+            ("C", 1.0 / 3.0),
+            ("D", 0.25),
+            ("E", 0.25),
+        ] {
+            assert_score(&scores, node, expected);
+        }
+    }
+
+    #[test]
+    fn directed_closeness_explicitly_uses_outward_distances() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+        kg.add_triple(Triple::new("B", "rel", "C"));
+
+        let scores = closeness_centrality(
+            &kg,
+            ClosenessConfig {
+                normalized: true,
+                undirected: false,
+                harmonic: false,
+            },
+        );
+
+        assert_score(&scores, "A", 2.0 / 3.0);
+        assert_score(&scores, "B", 0.5);
+        assert_score(&scores, "C", 0.0);
     }
 }

@@ -3,9 +3,9 @@
 //! Implements biased 2nd-order random walks as described in:
 //! Grover & Leskovec, "node2vec: Scalable Feature Learning for Networks" (KDD 2016)
 //!
-//! ## Performance Notes
+//! ## Performance notes
 //!
-//! - Uses rejection sampling for O(1) expected time per step (vs O(d^2) naive)
+//! - Samples from normalized transition weights in O(d) time per step
 //! - Caches previous node's neighbors in `HashSet` for O(1) membership test
 //! - Parallelized across walk iterations via rayon
 
@@ -15,6 +15,18 @@ use rand_xorshift::XorShiftRng;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::collections::HashSet;
+
+/// Invalid node2vec bias parameters.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RandomWalkConfigError {
+    /// The return parameter `p` must be finite and greater than zero.
+    #[error("return parameter p must be finite and greater than zero, got {0}")]
+    InvalidP(f32),
+    /// The in-out parameter `q` must be finite and greater than zero.
+    #[error("in-out parameter q must be finite and greater than zero, got {0}")]
+    InvalidQ(f32),
+}
 
 /// Configuration for random walks.
 #[derive(Debug, Clone, Copy)]
@@ -47,6 +59,22 @@ impl Default for RandomWalkConfig {
     }
 }
 
+impl RandomWalkConfig {
+    /// Validate the node2vec bias parameters.
+    ///
+    /// Both `p` and `q` must be finite and strictly positive. Walk length and
+    /// count are not bias parameters and may be zero.
+    pub fn validate(&self) -> Result<(), RandomWalkConfigError> {
+        if !self.p.is_finite() || self.p <= 0.0 {
+            return Err(RandomWalkConfigError::InvalidP(self.p));
+        }
+        if !self.q.is_finite() || self.q <= 0.0 {
+            return Err(RandomWalkConfigError::InvalidQ(self.q));
+        }
+        Ok(())
+    }
+}
+
 /// Generate random walks for all nodes in the graph.
 ///
 /// # Arguments
@@ -59,6 +87,14 @@ impl Default for RandomWalkConfig {
 pub fn generate_walks(kg: &KnowledgeGraph, config: RandomWalkConfig) -> Vec<Vec<String>> {
     let walker = Node2Vec::new(kg, config);
     walker.walk()
+}
+
+/// Generate random walks after validating the node2vec bias parameters.
+pub fn try_generate_walks(
+    kg: &KnowledgeGraph,
+    config: RandomWalkConfig,
+) -> Result<Vec<Vec<String>>, RandomWalkConfigError> {
+    Ok(Node2Vec::try_new(kg, config)?.walk())
 }
 
 /// A walk corpus over dense node indices (0..N).
@@ -126,14 +162,35 @@ pub struct Node2Vec<'a> {
 
 impl<'a> Node2Vec<'a> {
     /// Create a new `Node2Vec` walker.
+    ///
+    /// This preserves the original infallible constructor. Invalid bias
+    /// parameters fail immediately when [`Node2Vec::walk`] is called. Use
+    /// [`Node2Vec::try_new`] to validate them at construction time.
     #[must_use]
     pub const fn new(kg: &'a KnowledgeGraph, config: RandomWalkConfig) -> Self {
         Self { kg, config }
     }
 
+    /// Create a walker after validating its node2vec bias parameters.
+    pub fn try_new(
+        kg: &'a KnowledgeGraph,
+        config: RandomWalkConfig,
+    ) -> Result<Self, RandomWalkConfigError> {
+        config.validate()?;
+        Ok(Self { kg, config })
+    }
+
     /// Generate all random walks using parallel processing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `p` or `q` is zero, negative, or non-finite. Use
+    /// [`Node2Vec::try_new`] to validate configuration at construction time.
     #[must_use]
     pub fn walk(&self) -> Vec<Vec<String>> {
+        self.config
+            .validate()
+            .expect("invalid node2vec random-walk configuration");
         let node_indices: Vec<_> = self.kg.as_petgraph().node_indices().collect();
         let is_unbiased = (self.config.p - 1.0).abs() < f32::EPSILON
             && (self.config.q - 1.0).abs() < f32::EPSILON;
@@ -181,7 +238,7 @@ impl<'a> Node2Vec<'a> {
         walk
     }
 
-    /// Biased 2nd-order random walk - O(1) expected per step via rejection sampling.
+    /// Biased 2nd-order random walk.
     fn biased_walk<R: Rng>(&self, start: petgraph::graph::NodeIndex, rng: &mut R) -> Vec<String> {
         let graph = self.kg.as_petgraph();
         let mut walk = Vec::with_capacity(self.config.walk_length);
@@ -198,7 +255,7 @@ impl<'a> Node2Vec<'a> {
             }
 
             let next = if let Some(prev_node) = prev {
-                self.sample_biased_rejection(rng, prev_node, &prev_neighbors, &neighbors)
+                self.sample_biased(rng, prev_node, &prev_neighbors, &neighbors)
             } else {
                 // First step: uniform
                 *neighbors
@@ -217,11 +274,13 @@ impl<'a> Node2Vec<'a> {
         walk
     }
 
-    /// Sample next node using rejection sampling - O(1) expected time.
+    /// Sample the next node from the normalized node2vec transition weights.
     ///
-    /// The key insight: instead of computing weights for all neighbors (O(d)),
-    /// we sample uniformly and accept/reject based on bias. Expected trials ~2-3.
-    fn sample_biased_rejection<R: Rng>(
+    /// Scaling by the largest weight among the candidates prevents overflow
+    /// for extreme finite `p` or `q`. The single bounded pass also avoids the
+    /// unbounded rejection time that occurs when a large-weight transition
+    /// class is absent from `neighbors`.
+    fn sample_biased<R: Rng>(
         &self,
         rng: &mut R,
         prev_node: petgraph::graph::NodeIndex,
@@ -231,31 +290,39 @@ impl<'a> Node2Vec<'a> {
         let p = f64::from(self.config.p);
         let q = f64::from(self.config.q);
 
-        // Acceptance probabilities (unnormalized)
-        // - Return to prev: 1/p
-        // - Move to prev's neighbor (triangle): 1
-        // - Move away: 1/q
-        let max_prob = (1.0 / p).max(1.0).max(1.0 / q);
-
-        loop {
-            let candidate = *neighbors
-                .choose(rng)
-                .expect("internal: neighbors non-empty (caller guarantees)");
-            let r: f64 = rng.random();
-
-            let unnorm_prob = if candidate == prev_node {
+        let transition_weight = |candidate| {
+            if candidate == prev_node {
                 1.0 / p // Backtrack
             } else if prev_neighbors.contains(&candidate) {
                 1.0 // Triangle (dist=1 from prev)
             } else {
                 1.0 / q // Move away (dist=2 from prev)
-            };
+            }
+        };
 
-            if r < unnorm_prob / max_prob {
+        let max_weight = neighbors
+            .iter()
+            .copied()
+            .map(transition_weight)
+            .fold(0.0_f64, f64::max);
+        let total: f64 = neighbors
+            .iter()
+            .copied()
+            .map(|candidate| transition_weight(candidate) / max_weight)
+            .sum();
+        let mut draw = rng.random::<f64>() * total;
+
+        for &candidate in neighbors {
+            let weight = transition_weight(candidate) / max_weight;
+            if draw < weight {
                 return candidate;
             }
-            // Reject and retry
+            draw -= weight;
         }
+
+        *neighbors
+            .last()
+            .expect("internal: neighbors non-empty (caller guarantees)")
     }
 }
 
@@ -332,5 +399,124 @@ mod tests {
 
         // Same seed should produce same walks
         assert_eq!(walks1, walks2);
+    }
+
+    #[test]
+    fn config_rejects_non_positive_and_non_finite_biases() {
+        for p in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let config = RandomWalkConfig {
+                p,
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(RandomWalkConfigError::InvalidP(value)) if value.to_bits() == p.to_bits()
+            ));
+        }
+
+        for q in [0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            let config = RandomWalkConfig {
+                q,
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(RandomWalkConfigError::InvalidQ(value)) if value.to_bits() == q.to_bits()
+            ));
+        }
+    }
+
+    #[test]
+    fn checked_constructor_accepts_extreme_finite_biases() {
+        let kg = KnowledgeGraph::new();
+        for (p, q) in [(f32::MIN_POSITIVE, f32::MAX), (f32::MAX, f32::MIN_POSITIVE)] {
+            let config = RandomWalkConfig {
+                p,
+                q,
+                ..Default::default()
+            };
+            assert!(Node2Vec::try_new(&kg, config).is_ok());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid node2vec random-walk configuration")]
+    fn infallible_constructor_fails_fast_before_walking_with_invalid_bias() {
+        let kg = KnowledgeGraph::new();
+        let walker = Node2Vec::new(
+            &kg,
+            RandomWalkConfig {
+                p: 0.0,
+                ..Default::default()
+            },
+        );
+
+        let _ = walker.walk();
+    }
+
+    #[test]
+    fn biased_sampler_matches_explicit_normalized_distribution() {
+        use petgraph::graph::NodeIndex;
+
+        let kg = KnowledgeGraph::new();
+        let walker = Node2Vec::try_new(
+            &kg,
+            RandomWalkConfig {
+                p: 2.0,
+                q: 4.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let previous = NodeIndex::new(0);
+        let triangle = NodeIndex::new(1);
+        let outward = NodeIndex::new(2);
+        let neighbors = [previous, triangle, outward];
+        let previous_neighbors = HashSet::from([triangle]);
+        let expected_weights = [0.5_f64, 1.0, 0.25];
+        let expected_total: f64 = expected_weights.iter().sum();
+        let expected = expected_weights.map(|weight| weight / expected_total);
+
+        let mut rng = XorShiftRng::seed_from_u64(73);
+        let mut counts = [0_usize; 3];
+        const DRAWS: usize = 200_000;
+        for _ in 0..DRAWS {
+            let sampled = walker.sample_biased(&mut rng, previous, &previous_neighbors, &neighbors);
+            counts[sampled.index()] += 1;
+        }
+
+        for (count, expected_probability) in counts.into_iter().zip(expected) {
+            let observed = count as f64 / DRAWS as f64;
+            assert!(
+                (observed - expected_probability).abs() < 0.005,
+                "observed {observed}, expected {expected_probability}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_extreme_weight_class_does_not_stall_sampling() {
+        use petgraph::graph::NodeIndex;
+
+        let kg = KnowledgeGraph::new();
+        let walker = Node2Vec::try_new(
+            &kg,
+            RandomWalkConfig {
+                p: f32::MIN_POSITIVE,
+                q: f32::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let previous = NodeIndex::new(0);
+        let only_triangle = NodeIndex::new(1);
+        let neighbors = [only_triangle];
+        let previous_neighbors = HashSet::from([only_triangle]);
+        let mut rng = XorShiftRng::seed_from_u64(11);
+
+        assert_eq!(
+            walker.sample_biased(&mut rng, previous, &previous_neighbors, &neighbors),
+            only_triangle
+        );
     }
 }

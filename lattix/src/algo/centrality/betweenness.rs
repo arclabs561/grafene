@@ -41,9 +41,9 @@
 //! C_B_norm(v) = C_B(v) / [(n-1)(n-2)]
 //! ```
 //!
-//! For undirected graphs (each path counted twice):
+//! For undirected graphs:
 //! ```text
-//! C_B_norm(v) = 2 × C_B(v) / [(n-1)(n-2)]
+//! C_B_norm(v) = C_B(v) / {[(n-1)(n-2)] / 2}
 //! ```
 //!
 //! # References
@@ -58,7 +58,9 @@ use std::collections::{HashMap, VecDeque};
 /// Configuration for betweenness centrality.
 #[derive(Debug, Clone, Copy)]
 pub struct BetweennessConfig {
-    /// Normalize scores to [0, 1] range.
+    /// Divide by the number of possible source-target pairs.
+    ///
+    /// Undirected pairs are counted once; directed pairs are ordered.
     pub normalized: bool,
     /// Treat graph as undirected (follow edges both ways).
     pub undirected: bool,
@@ -146,11 +148,17 @@ pub fn betweenness_centrality(
         }
     }
 
-    // Normalize if requested
+    // Normalize the already de-duplicated undirected counts by the number of
+    // possible unordered pairs. Directed counts use ordered pairs.
     if config.normalized && n > 2 {
         let norm = ((n - 1) * (n - 2)) as f64;
+        let scale = if config.undirected {
+            2.0 / norm
+        } else {
+            1.0 / norm
+        };
         for b in &mut betweenness {
-            *b /= norm;
+            *b *= scale;
         }
     }
 
@@ -311,8 +319,131 @@ mod tests {
         };
         let scores = betweenness_centrality(&kg, config);
 
-        // B is on path from A to C and from C to A
         let b = *scores.get("B").unwrap();
-        assert!(b > 0.0, "B should be on shortest paths: {b}");
+        assert_eq!(b, 1.0);
+    }
+
+    fn assert_score(scores: &HashMap<EntityId, f64>, node: &str, expected: f64) {
+        let actual = scores[node];
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{node}: expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn normalized_undirected_path_uses_unordered_pair_denominator() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+        kg.add_triple(Triple::new("B", "rel", "C"));
+        kg.add_triple(Triple::new("C", "rel", "D"));
+
+        let scores = betweenness_centrality(
+            &kg,
+            BetweennessConfig {
+                normalized: true,
+                undirected: true,
+            },
+        );
+
+        for (node, expected) in [("A", 0.0), ("B", 2.0 / 3.0), ("C", 2.0 / 3.0), ("D", 0.0)] {
+            assert_score(&scores, node, expected);
+        }
+    }
+
+    #[test]
+    fn normalized_directed_path_uses_ordered_pair_denominator() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+        kg.add_triple(Triple::new("B", "rel", "C"));
+
+        let scores = betweenness_centrality(
+            &kg,
+            BetweennessConfig {
+                normalized: true,
+                undirected: false,
+            },
+        );
+
+        assert_score(&scores, "A", 0.0);
+        assert_score(&scores, "B", 0.5);
+        assert_score(&scores, "C", 0.0);
+    }
+
+    #[test]
+    fn normalized_undirected_star_cycle_and_complete_match_oracles() {
+        let mut star = KnowledgeGraph::new();
+        for leaf in ["A", "B", "C"] {
+            star.add_triple(Triple::new("Hub", "rel", leaf));
+        }
+        let star_scores = betweenness_centrality(
+            &star,
+            BetweennessConfig {
+                normalized: true,
+                undirected: true,
+            },
+        );
+        assert_score(&star_scores, "Hub", 1.0);
+        for leaf in ["A", "B", "C"] {
+            assert_score(&star_scores, leaf, 0.0);
+        }
+
+        let mut cycle = KnowledgeGraph::new();
+        for (from, to) in [("A", "B"), ("B", "C"), ("C", "D"), ("D", "A")] {
+            cycle.add_triple(Triple::new(from, "rel", to));
+        }
+        let cycle_scores = betweenness_centrality(
+            &cycle,
+            BetweennessConfig {
+                normalized: true,
+                undirected: true,
+            },
+        );
+        for node in ["A", "B", "C", "D"] {
+            assert_score(&cycle_scores, node, 1.0 / 6.0);
+        }
+
+        let mut complete = KnowledgeGraph::new();
+        for (from, to) in [
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("B", "C"),
+            ("B", "D"),
+            ("C", "D"),
+        ] {
+            complete.add_triple(Triple::new(from, "rel", to));
+        }
+        let complete_scores = betweenness_centrality(
+            &complete,
+            BetweennessConfig {
+                normalized: true,
+                undirected: true,
+            },
+        );
+        for node in ["A", "B", "C", "D"] {
+            assert_score(&complete_scores, node, 0.0);
+        }
+    }
+
+    #[test]
+    fn normalized_undirected_disconnected_graph_uses_global_node_count() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+        kg.add_triple(Triple::new("B", "rel", "C"));
+        kg.add_triple(Triple::new("D", "rel", "E"));
+
+        let scores = betweenness_centrality(
+            &kg,
+            BetweennessConfig {
+                normalized: true,
+                undirected: true,
+            },
+        );
+
+        assert_score(&scores, "B", 1.0 / 6.0);
+        for node in ["A", "C", "D", "E"] {
+            assert_score(&scores, node, 0.0);
+        }
     }
 }
