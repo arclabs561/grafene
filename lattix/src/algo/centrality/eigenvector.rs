@@ -71,8 +71,8 @@ impl Default for EigenvectorConfig {
 ///
 /// # Complexity
 ///
-/// - Time: O(E log d_max × iterations) with parallel-edge deduplication
-/// - Space: O(V)
+/// - Time: O(E log d_max + E × iterations) with parallel-edge deduplication
+/// - Space: O(V + E)
 ///
 /// # Example
 ///
@@ -108,22 +108,28 @@ pub fn eigenvector_centrality(
     let init_val = 1.0 / (n as f64).sqrt();
     let mut scores = vec![init_val; n];
     let mut new_scores = vec![0.0; n];
+    let predecessors: Vec<Vec<_>> = graph
+        .node_indices()
+        .map(|idx| {
+            let neighbors = if config.undirected {
+                crate::algo::unique_neighbors_undirected(graph, idx)
+            } else {
+                crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Incoming)
+            };
+            neighbors
+                .into_iter()
+                .map(|neighbor| neighbor.index())
+                .collect()
+        })
+        .collect();
 
     for _iter in 0..config.max_iterations {
         // Compute A × x (or A^T × x for in-edge centrality)
         new_scores.fill(0.0);
 
-        for idx in graph.node_indices() {
-            // Get predecessors (nodes pointing to this node)
-            let predecessors: Vec<_> = if config.undirected {
-                crate::algo::unique_neighbors_undirected(graph, idx)
-            } else {
-                crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Incoming)
-            };
-
-            // Sum scores of predecessors
-            for pred in predecessors {
-                new_scores[idx.index()] += scores[pred.index()];
+        for (idx, neighbors) in predecessors.iter().enumerate() {
+            for &pred in neighbors {
+                new_scores[idx] += scores[pred];
             }
         }
 

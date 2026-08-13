@@ -56,6 +56,20 @@ fn make_star(n: usize) -> KnowledgeGraph {
     kg
 }
 
+/// Dense fan-in/fan-out graph with several predicates per unique edge.
+fn make_parallel_hubs(n: usize, parallel_edges: usize) -> KnowledgeGraph {
+    let mut kg = KnowledgeGraph::with_capacity(n, 2 * (n - 1) * parallel_edges);
+    for i in 1..n {
+        let leaf = format!("node_{i}");
+        for edge in 0..parallel_edges {
+            let predicate = format!("rel_{edge}");
+            kg.add_triple(Triple::new("hub", predicate.as_str(), leaf.as_str()));
+            kg.add_triple(Triple::new(leaf.as_str(), predicate.as_str(), "hub"));
+        }
+    }
+    kg
+}
+
 /// Generate N-Triples formatted string for a ring graph of size n.
 #[cfg(feature = "formats")]
 fn make_ntriples_string(n: usize) -> String {
@@ -204,8 +218,9 @@ fn bench_query(c: &mut Criterion) {
 #[cfg(feature = "algo")]
 fn bench_centrality(c: &mut Criterion) {
     use lattix::algo::centrality::{
-        betweenness_centrality, closeness_centrality, degree_centrality, hits, BetweennessConfig,
-        ClosenessConfig, HitsConfig,
+        betweenness_centrality, closeness_centrality, degree_centrality, eigenvector_centrality,
+        hits, katz_centrality, BetweennessConfig, ClosenessConfig, EigenvectorConfig, HitsConfig,
+        KatzConfig,
     };
     use lattix::algo::pagerank::{pagerank, PageRankConfig};
 
@@ -257,6 +272,24 @@ fn bench_centrality(c: &mut Criterion) {
             b.iter(|| black_box(hits(kg, HitsConfig::default())));
         });
     }
+
+    // Iterative algorithms on a graph where deduplicating adjacency each round is costly.
+    let parallel_hubs = make_parallel_hubs(256, 16);
+    group.throughput(Throughput::Elements(parallel_hubs.triple_count() as u64));
+    group.bench_function("hits_parallel_hubs", |b| {
+        b.iter(|| black_box(hits(&parallel_hubs, HitsConfig::default())));
+    });
+    group.bench_function("eigenvector_parallel_hubs", |b| {
+        b.iter(|| {
+            black_box(eigenvector_centrality(
+                &parallel_hubs,
+                EigenvectorConfig::default(),
+            ))
+        });
+    });
+    group.bench_function("katz_parallel_hubs", |b| {
+        b.iter(|| black_box(katz_centrality(&parallel_hubs, KatzConfig::default())));
+    });
 
     group.finish();
 }

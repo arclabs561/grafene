@@ -81,8 +81,8 @@ impl Default for KatzConfig {
 ///
 /// # Complexity
 ///
-/// - Time: O(E log d_max × iterations) with parallel-edge deduplication
-/// - Space: O(V)
+/// - Time: O(E log d_max + E × iterations) with parallel-edge deduplication
+/// - Space: O(V + E)
 ///
 /// # Example
 ///
@@ -121,22 +121,27 @@ pub fn katz_centrality(kg: &KnowledgeGraph, config: KatzConfig) -> HashMap<Entit
     // Initialize with beta
     let mut scores = vec![config.beta; n];
     let mut new_scores = vec![0.0; n];
-
-    for _iter in 0..config.max_iterations {
-        // x^(k+1) = α A^T x^(k) + β
-        for idx in graph.node_indices() {
-            let i = idx.index();
-
-            // Get predecessors
-            let predecessors: Vec<_> = if config.undirected {
+    let predecessors: Vec<Vec<_>> = graph
+        .node_indices()
+        .map(|idx| {
+            let neighbors = if config.undirected {
                 crate::algo::unique_neighbors_undirected(graph, idx)
             } else {
                 crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Incoming)
             };
+            neighbors
+                .into_iter()
+                .map(|neighbor| neighbor.index())
+                .collect()
+        })
+        .collect();
 
+    for _iter in 0..config.max_iterations {
+        // x^(k+1) = α A^T x^(k) + β
+        for (idx, neighbors) in predecessors.iter().enumerate() {
             // α × Σ x_pred + β
-            let pred_sum: f64 = predecessors.iter().map(|p| scores[p.index()]).sum();
-            new_scores[i] = config.alpha * pred_sum + config.beta;
+            let pred_sum: f64 = neighbors.iter().map(|&pred| scores[pred]).sum();
+            new_scores[idx] = config.alpha * pred_sum + config.beta;
         }
 
         // Check convergence

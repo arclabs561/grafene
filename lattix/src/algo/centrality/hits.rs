@@ -84,8 +84,8 @@ pub struct HitsScores {
 ///
 /// # Complexity
 ///
-/// - Time: O(E log d_max × iterations) with parallel-edge deduplication
-/// - Space: O(V)
+/// - Time: O(E log d_max + E × iterations) with parallel-edge deduplication
+/// - Space: O(V + E)
 ///
 /// # Example
 ///
@@ -119,16 +119,32 @@ pub fn hits(kg: &KnowledgeGraph, config: HitsConfig) -> HashMap<EntityId, HitsSc
     let mut auth = vec![init_val; n];
     let mut new_hub = vec![0.0; n];
     let mut new_auth = vec![0.0; n];
+    let incoming: Vec<Vec<_>> = graph
+        .node_indices()
+        .map(|idx| {
+            crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Incoming)
+                .into_iter()
+                .map(|neighbor| neighbor.index())
+                .collect()
+        })
+        .collect();
+    let outgoing: Vec<Vec<_>> = graph
+        .node_indices()
+        .map(|idx| {
+            crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Outgoing)
+                .into_iter()
+                .map(|neighbor| neighbor.index())
+                .collect()
+        })
+        .collect();
 
     for _iter in 0..config.max_iterations {
         // Step 1: Update authority scores
         // auth(v) = Σ_{u→v} hub(u)
         new_auth.fill(0.0);
-        for idx in graph.node_indices() {
-            let incoming =
-                crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Incoming);
-            for pred in incoming {
-                new_auth[idx.index()] += hub[pred.index()];
+        for (idx, predecessors) in incoming.iter().enumerate() {
+            for &pred in predecessors {
+                new_auth[idx] += hub[pred];
             }
         }
 
@@ -143,11 +159,9 @@ pub fn hits(kg: &KnowledgeGraph, config: HitsConfig) -> HashMap<EntityId, HitsSc
         // Step 2: Update hub scores
         // hub(v) = Σ_{v→u} auth(u)
         new_hub.fill(0.0);
-        for idx in graph.node_indices() {
-            let outgoing =
-                crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Outgoing);
-            for succ in outgoing {
-                new_hub[idx.index()] += new_auth[succ.index()];
+        for (idx, successors) in outgoing.iter().enumerate() {
+            for &succ in successors {
+                new_hub[idx] += new_auth[succ];
             }
         }
 
