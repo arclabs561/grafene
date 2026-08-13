@@ -9,6 +9,32 @@
 use crate::{EntityId, KnowledgeGraph};
 use std::collections::HashMap;
 
+/// Invalid input to personalized PageRank.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PprError {
+    /// The damping factor was not finite or outside `[0, 1]`.
+    #[error("damping factor must be finite and in [0, 1], got {0}")]
+    InvalidDamping(f64),
+    /// The convergence tolerance was not finite and strictly positive.
+    #[error("tolerance must be finite and greater than zero, got {0}")]
+    InvalidTolerance(f64),
+    /// The requested seed is absent from the graph.
+    #[error("seed entity is not present in the graph")]
+    SeedNotFound,
+}
+
+/// Scores and termination information from a personalized PageRank iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PprResult {
+    /// Score for each entity. Scores sum to one for a non-empty graph.
+    pub scores: HashMap<EntityId, f64>,
+    /// Number of power iterations performed.
+    pub iterations: usize,
+    /// Whether the L1 score change became smaller than the configured tolerance.
+    pub converged: bool,
+}
+
 /// PPR configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct PprConfig {
@@ -31,12 +57,27 @@ impl Default for PprConfig {
     }
 }
 
+impl PprConfig {
+    /// Validate the numeric iteration parameters.
+    pub fn validate(&self) -> Result<(), PprError> {
+        if !self.damping.is_finite() || !(0.0..=1.0).contains(&self.damping) {
+            return Err(PprError::InvalidDamping(self.damping));
+        }
+        if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(PprError::InvalidTolerance(self.tolerance));
+        }
+        Ok(())
+    }
+}
+
 /// Compute personalized PageRank from a seed entity.
 ///
 /// Returns scores keyed by entity ID. Higher scores indicate
 /// entities closer/more connected to the seed in the graph's link structure.
 ///
 /// Returns an empty map if the graph is empty or the seed entity is not found.
+/// Invalid numeric parameters panic; use [`try_personalized_pagerank`] to
+/// handle them or inspect convergence.
 ///
 /// # Example
 ///
@@ -59,17 +100,36 @@ pub fn personalized_pagerank(
     seed: &str,
     config: PprConfig,
 ) -> HashMap<EntityId, f64> {
+    match try_personalized_pagerank(kg, seed, config) {
+        Ok(result) => result.scores,
+        Err(PprError::SeedNotFound) => HashMap::new(),
+        Err(error) => panic!("invalid personalized PageRank configuration: {error}"),
+    }
+}
+
+/// Checked form of [`personalized_pagerank`] with explicit termination information.
+#[allow(clippy::cast_precision_loss)]
+pub fn try_personalized_pagerank(
+    kg: &KnowledgeGraph,
+    seed: &str,
+    config: PprConfig,
+) -> Result<PprResult, PprError> {
+    config.validate()?;
     let graph = kg.as_petgraph();
     let n = graph.node_count();
     if n == 0 {
-        return HashMap::new();
+        return Ok(PprResult {
+            scores: HashMap::new(),
+            iterations: 0,
+            converged: true,
+        });
     }
 
     // Find the seed node index
     let seed_id = crate::EntityId::from(seed);
     let seed_idx = match kg.get_node_index(&seed_id) {
         Some(idx) => idx.index(),
-        None => return HashMap::new(),
+        None => return Err(PprError::SeedNotFound),
     };
 
     let mut personalization = vec![0.0; n];
@@ -88,7 +148,10 @@ pub fn personalized_pagerank(
     let mut scores = personalization.clone();
     let mut next = vec![0.0; n];
 
+    let mut iterations = 0;
+    let mut converged = false;
     for _ in 0..config.max_iterations {
+        iterations += 1;
         for (idx, value) in next.iter_mut().enumerate() {
             *value = (1.0 - config.damping) * personalization[idx];
         }
@@ -121,6 +184,7 @@ pub fn personalized_pagerank(
             .sum();
         std::mem::swap(&mut scores, &mut next);
         if diff < config.tolerance {
+            converged = true;
             break;
         }
     }
@@ -130,7 +194,11 @@ pub fn personalized_pagerank(
         let entity = &graph[petgraph::graph::NodeIndex::new(idx)];
         result.insert(entity.id.clone(), score);
     }
-    result
+    Ok(PprResult {
+        scores: result,
+        iterations,
+        converged,
+    })
 }
 
 #[cfg(test)]
@@ -187,5 +255,93 @@ mod tests {
             (total - 1.0).abs() < 1e-6,
             "Scores should sum to 1.0, got {total}",
         );
+    }
+
+    #[test]
+    fn checked_ppr_rejects_invalid_input() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+
+        for damping in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            let error = try_personalized_pagerank(
+                &kg,
+                "A",
+                PprConfig {
+                    damping,
+                    ..PprConfig::default()
+                },
+            )
+            .unwrap_err();
+            match error {
+                PprError::InvalidDamping(value) => {
+                    assert_eq!(value.to_bits(), damping.to_bits());
+                }
+                _ => panic!("expected an invalid damping factor"),
+            }
+        }
+        for tolerance in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let error = try_personalized_pagerank(
+                &kg,
+                "A",
+                PprConfig {
+                    tolerance,
+                    ..PprConfig::default()
+                },
+            )
+            .unwrap_err();
+            match error {
+                PprError::InvalidTolerance(value) => {
+                    assert_eq!(value.to_bits(), tolerance.to_bits());
+                }
+                _ => panic!("expected an invalid tolerance"),
+            }
+        }
+        assert_eq!(
+            try_personalized_pagerank(&kg, "missing", PprConfig::default()).unwrap_err(),
+            PprError::SeedNotFound
+        );
+    }
+
+    #[test]
+    fn checked_ppr_reports_iteration_limit() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+
+        let result = try_personalized_pagerank(
+            &kg,
+            "A",
+            PprConfig {
+                max_iterations: 0,
+                ..PprConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!result.converged);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.scores["A"], 1.0);
+        assert_eq!(result.scores["B"], 0.0);
+    }
+
+    #[test]
+    fn checked_ppr_has_exact_one_step_oracle() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+
+        let result = try_personalized_pagerank(
+            &kg,
+            "A",
+            PprConfig {
+                damping: 0.5,
+                max_iterations: 1,
+                tolerance: 1e-12,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.iterations, 1);
+        assert!(!result.converged);
+        assert!((result.scores["A"] - 0.5).abs() < 1e-15);
+        assert!((result.scores["B"] - 0.5).abs() < 1e-15);
     }
 }

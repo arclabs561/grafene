@@ -9,6 +9,29 @@
 use crate::{EntityId, KnowledgeGraph};
 use std::collections::HashMap;
 
+/// Invalid PageRank iteration parameters.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PageRankConfigError {
+    /// The damping factor was not finite or outside `[0, 1]`.
+    #[error("damping factor must be finite and in [0, 1], got {0}")]
+    InvalidDampingFactor(f64),
+    /// The convergence tolerance was not finite and strictly positive.
+    #[error("tolerance must be finite and greater than zero, got {0}")]
+    InvalidTolerance(f64),
+}
+
+/// Scores and termination information from a PageRank iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageRankResult {
+    /// Score for each entity. Scores sum to one for a non-empty graph.
+    pub scores: HashMap<EntityId, f64>,
+    /// Number of power iterations performed.
+    pub iterations: usize,
+    /// Whether the L1 score change became smaller than the configured tolerance.
+    pub converged: bool,
+}
+
 /// `PageRank` configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct PageRankConfig {
@@ -31,17 +54,52 @@ impl Default for PageRankConfig {
     }
 }
 
+impl PageRankConfig {
+    /// Validate the numeric iteration parameters.
+    pub fn validate(&self) -> Result<(), PageRankConfigError> {
+        if !self.damping_factor.is_finite() || !(0.0..=1.0).contains(&self.damping_factor) {
+            return Err(PageRankConfigError::InvalidDampingFactor(
+                self.damping_factor,
+            ));
+        }
+        if !self.tolerance.is_finite() || self.tolerance <= 0.0 {
+            return Err(PageRankConfigError::InvalidTolerance(self.tolerance));
+        }
+        Ok(())
+    }
+}
+
 /// Compute `PageRank` for all entities.
 ///
 /// Returns a map of `EntityId` -> Score, where scores sum to 1.0.
 ///
+/// # Panics
+///
+/// Panics if the damping factor or tolerance is invalid. Use [`try_pagerank`]
+/// to handle invalid input or inspect convergence.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn pagerank(kg: &KnowledgeGraph, config: PageRankConfig) -> HashMap<EntityId, f64> {
+    try_pagerank(kg, config)
+        .expect("pagerank requires a finite damping factor in [0, 1] and a positive tolerance")
+        .scores
+}
+
+/// Checked form of [`pagerank`] with explicit termination information.
+#[allow(clippy::cast_precision_loss)]
+pub fn try_pagerank(
+    kg: &KnowledgeGraph,
+    config: PageRankConfig,
+) -> Result<PageRankResult, PageRankConfigError> {
+    config.validate()?;
     let graph = kg.as_petgraph();
     let n = graph.node_count();
     if n == 0 {
-        return HashMap::new();
+        return Ok(PageRankResult {
+            scores: HashMap::new(),
+            iterations: 0,
+            converged: true,
+        });
     }
 
     let adjacency: Vec<Vec<_>> = graph
@@ -60,7 +118,10 @@ pub fn pagerank(kg: &KnowledgeGraph, config: PageRankConfig) -> HashMap<EntityId
     let mut scores = vec![1.0 / n_f; n];
     let mut next = vec![0.0; n];
 
+    let mut iterations = 0;
+    let mut converged = false;
     for _ in 0..config.max_iterations {
+        iterations += 1;
         next.fill(teleport);
 
         let dangling: f64 = adjacency
@@ -91,6 +152,7 @@ pub fn pagerank(kg: &KnowledgeGraph, config: PageRankConfig) -> HashMap<EntityId
             .sum();
         std::mem::swap(&mut scores, &mut next);
         if diff < config.tolerance {
+            converged = true;
             break;
         }
     }
@@ -100,7 +162,11 @@ pub fn pagerank(kg: &KnowledgeGraph, config: PageRankConfig) -> HashMap<EntityId
         let entity = &graph[petgraph::graph::NodeIndex::new(idx)];
         result.insert(entity.id.clone(), score);
     }
-    result
+    Ok(PageRankResult {
+        scores: result,
+        iterations,
+        converged,
+    })
 }
 
 #[cfg(test)]
@@ -163,5 +229,83 @@ mod tests {
             (total - 1.0).abs() < 1e-6,
             "Scores should sum to 1.0, got {total}",
         );
+    }
+
+    #[test]
+    fn checked_pagerank_rejects_invalid_numeric_parameters() {
+        let kg = KnowledgeGraph::new();
+        for damping in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            let error = try_pagerank(
+                &kg,
+                PageRankConfig {
+                    damping_factor: damping,
+                    ..PageRankConfig::default()
+                },
+            )
+            .unwrap_err();
+            match error {
+                PageRankConfigError::InvalidDampingFactor(value) => {
+                    assert_eq!(value.to_bits(), damping.to_bits());
+                }
+                _ => panic!("expected an invalid damping factor"),
+            }
+        }
+        for tolerance in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            let error = try_pagerank(
+                &kg,
+                PageRankConfig {
+                    tolerance,
+                    ..PageRankConfig::default()
+                },
+            )
+            .unwrap_err();
+            match error {
+                PageRankConfigError::InvalidTolerance(value) => {
+                    assert_eq!(value.to_bits(), tolerance.to_bits());
+                }
+                _ => panic!("expected an invalid tolerance"),
+            }
+        }
+    }
+
+    #[test]
+    fn checked_pagerank_reports_iteration_limit() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+
+        let result = try_pagerank(
+            &kg,
+            PageRankConfig {
+                max_iterations: 0,
+                ..PageRankConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!result.converged);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.scores["A"], 0.5);
+        assert_eq!(result.scores["B"], 0.5);
+    }
+
+    #[test]
+    fn checked_pagerank_has_exact_one_step_oracle() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_triple(Triple::new("A", "rel", "B"));
+
+        let result = try_pagerank(
+            &kg,
+            PageRankConfig {
+                damping_factor: 0.5,
+                max_iterations: 1,
+                tolerance: 1e-12,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.iterations, 1);
+        assert!(!result.converged);
+        assert!((result.scores["A"] - 0.375).abs() < 1e-15);
+        assert!((result.scores["B"] - 0.625).abs() < 1e-15);
     }
 }
