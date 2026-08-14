@@ -28,18 +28,6 @@ impl Default for LabelPropagationConfig {
     }
 }
 
-/// Adapter: borrowed adjacency list implementing `graphops::GraphRef`.
-struct AdjList(Vec<Vec<usize>>);
-
-impl graphops::GraphRef for AdjList {
-    fn node_count(&self) -> usize {
-        self.0.len()
-    }
-    fn neighbors_ref(&self, node: usize) -> &[usize] {
-        &self.0[node]
-    }
-}
-
 /// Detect communities via label propagation.
 ///
 /// Returns a map from entity ID to community label (`usize`).
@@ -77,25 +65,9 @@ pub fn label_propagation(
         return HashMap::new();
     }
 
-    // Build undirected adjacency list from the directed petgraph.
-    // Label propagation is defined on undirected graphs, so we include
-    // both in- and out-neighbors.
-    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for edge in graph.edge_indices() {
-        if let Some((src, dst)) = graph.edge_endpoints(edge) {
-            let s = src.index();
-            let d = dst.index();
-            adj[s].push(d);
-            adj[d].push(s);
-        }
-    }
-    // Deduplicate (parallel edges can create duplicates)
-    for neighbors in &mut adj {
-        neighbors.sort_unstable();
-        neighbors.dedup();
-    }
-
-    let adapter = AdjList(adj);
+    // Label propagation is defined on undirected graphs, so the shared view
+    // includes both in- and out-neighbors.
+    let adapter = crate::algo::DedupAdjacency::undirected(graph);
     let labels =
         graphops::partition::label_propagation(&adapter, config.max_iterations, config.seed);
 

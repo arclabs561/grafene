@@ -50,6 +50,7 @@ pub mod label_propagation;
 use std::collections::HashMap;
 
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
 use crate::EntityId;
 
@@ -114,9 +115,66 @@ fn dedup_nodes(nodes: &mut Vec<NodeIndex>) {
     nodes.dedup();
 }
 
+/// A compact adjacency view whose rows contain sorted, unique node indices.
+///
+/// Building this once avoids independently materializing the same graph for
+/// algorithms that only need unweighted adjacency.
+pub(crate) struct DedupAdjacency(Vec<Vec<usize>>);
+
+impl DedupAdjacency {
+    pub(crate) fn directed(
+        graph: &petgraph::Graph<crate::Entity, crate::Relation>,
+        direction: petgraph::Direction,
+    ) -> Self {
+        let mut rows = vec![Vec::new(); graph.node_count()];
+        for edge in graph.edge_references() {
+            let (row, neighbor) = match direction {
+                petgraph::Direction::Outgoing => (edge.source(), edge.target()),
+                petgraph::Direction::Incoming => (edge.target(), edge.source()),
+            };
+            rows[row.index()].push(neighbor.index());
+        }
+        Self::finish(rows)
+    }
+
+    pub(crate) fn undirected(graph: &petgraph::Graph<crate::Entity, crate::Relation>) -> Self {
+        let mut rows = vec![Vec::new(); graph.node_count()];
+        for edge in graph.edge_references() {
+            let source = edge.source().index();
+            let target = edge.target().index();
+            rows[source].push(target);
+            rows[target].push(source);
+        }
+        Self::finish(rows)
+    }
+
+    fn finish(mut rows: Vec<Vec<usize>>) -> Self {
+        for row in &mut rows {
+            row.sort_unstable();
+            row.dedup();
+        }
+        Self(rows)
+    }
+
+    pub(crate) fn rows(&self) -> &[Vec<usize>] {
+        &self.0
+    }
+}
+
+impl graphops::GraphRef for DedupAdjacency {
+    fn node_count(&self) -> usize {
+        self.0.len()
+    }
+
+    fn neighbors_ref(&self, node: usize) -> &[usize] {
+        &self.0[node]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use graphops::GraphRef;
 
     #[test]
     fn top_n_breaks_equal_score_ties_by_entity_id() {
@@ -163,5 +221,109 @@ mod tests {
                 "nan"
             ]
         );
+    }
+
+    #[test]
+    fn dedup_adjacency_preserves_direction_and_unique_nodes() {
+        let mut graph = petgraph::Graph::new();
+        let a = graph.add_node(crate::Entity::new("A"));
+        let b = graph.add_node(crate::Entity::new("B"));
+        let c = graph.add_node(crate::Entity::new("C"));
+        graph.add_edge(a, b, crate::Relation::new("first"));
+        graph.add_edge(a, b, crate::Relation::new("parallel"));
+        graph.add_edge(b, b, crate::Relation::new("loop"));
+
+        let outgoing = DedupAdjacency::directed(&graph, petgraph::Direction::Outgoing);
+        assert_eq!(outgoing.node_count(), 3);
+        assert_eq!(outgoing.neighbors_ref(a.index()), &[b.index()]);
+        assert_eq!(outgoing.neighbors_ref(b.index()), &[b.index()]);
+        assert!(outgoing.neighbors_ref(c.index()).is_empty());
+
+        let incoming = DedupAdjacency::directed(&graph, petgraph::Direction::Incoming);
+        assert!(incoming.neighbors_ref(a.index()).is_empty());
+        assert_eq!(incoming.neighbors_ref(b.index()), &[a.index(), b.index()]);
+        assert!(incoming.neighbors_ref(c.index()).is_empty());
+
+        let undirected = DedupAdjacency::undirected(&graph);
+        assert_eq!(undirected.neighbors_ref(a.index()), &[b.index()]);
+        assert_eq!(undirected.neighbors_ref(b.index()), &[a.index(), b.index()]);
+        assert!(undirected.neighbors_ref(c.index()).is_empty());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_oracles {
+    use crate::{KnowledgeGraph, Triple};
+
+    pub(crate) fn graph_with_dense_adjacency(
+        node_count: usize,
+        requested_edges: &[bool],
+    ) -> (KnowledgeGraph, Vec<Vec<bool>>) {
+        assert!(node_count >= 2);
+        assert_eq!(requested_edges.len(), node_count * node_count);
+        let mut graph = KnowledgeGraph::new();
+        let mut adjacency = vec![vec![false; node_count]; node_count];
+
+        // Materialize every node through a directed star. Its leaves provide
+        // dangling-node cases when the generated edges do not add outlinks.
+        for (target, edge) in adjacency[0].iter_mut().enumerate().skip(1) {
+            graph.add_triple(Triple::new("n0", "base", format!("n{target}")));
+            *edge = true;
+        }
+        for source in 0..node_count {
+            for target in 0..node_count {
+                if requested_edges[source * node_count + target] {
+                    let source_id = format!("n{source}");
+                    let target_id = format!("n{target}");
+                    graph.add_triple(Triple::new(
+                        source_id.as_str(),
+                        "generated",
+                        target_id.as_str(),
+                    ));
+                    // Deliberate parallel edge: the dense oracle remains boolean.
+                    graph.add_triple(Triple::new(
+                        source_id.as_str(),
+                        "parallel",
+                        target_id.as_str(),
+                    ));
+                    adjacency[source][target] = true;
+                }
+            }
+        }
+        (graph, adjacency)
+    }
+
+    pub(crate) fn dense_walk(
+        adjacency: &[Vec<bool>],
+        initial: &[f64],
+        personalization: &[f64],
+        damping: f64,
+        iterations: usize,
+    ) -> Vec<f64> {
+        let n = adjacency.len();
+        let mut scores = initial.to_vec();
+        for _ in 0..iterations {
+            let mut next: Vec<_> = personalization
+                .iter()
+                .map(|value| (1.0 - damping) * value)
+                .collect();
+            for source in 0..n {
+                let degree = adjacency[source].iter().filter(|&&edge| edge).count();
+                if degree == 0 {
+                    for (value, &personalized) in next.iter_mut().zip(personalization) {
+                        *value += damping * scores[source] * personalized;
+                    }
+                } else {
+                    let share = damping * scores[source] / degree as f64;
+                    for (target, &edge) in adjacency[source].iter().enumerate() {
+                        if edge {
+                            next[target] += share;
+                        }
+                    }
+                }
+            }
+            scores = next;
+        }
+        scores
     }
 }

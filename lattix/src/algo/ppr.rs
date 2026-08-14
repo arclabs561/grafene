@@ -135,15 +135,8 @@ pub fn try_personalized_pagerank(
     let mut personalization = vec![0.0; n];
     personalization[seed_idx] = 1.0;
 
-    let adjacency: Vec<Vec<_>> = graph
-        .node_indices()
-        .map(|idx| {
-            crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Outgoing)
-                .into_iter()
-                .map(|n| n.index())
-                .collect()
-        })
-        .collect();
+    let adjacency = crate::algo::DedupAdjacency::directed(graph, petgraph::Direction::Outgoing);
+    let adjacency = adjacency.rows();
 
     let mut scores = personalization.clone();
     let mut next = vec![0.0; n];
@@ -205,6 +198,7 @@ pub fn try_personalized_pagerank(
 mod tests {
     use super::*;
     use crate::Triple;
+    use proptest::prelude::*;
 
     #[test]
     fn ppr_seed_scores_highest() {
@@ -343,5 +337,51 @@ mod tests {
         assert!(!result.converged);
         assert!((result.scores["A"] - 0.5).abs() < 1e-15);
         assert!((result.scores["B"] - 0.5).abs() < 1e-15);
+    }
+
+    proptest! {
+        #[test]
+        fn one_hot_ppr_matches_independent_dense_transition(
+            node_count in 2usize..=5,
+            edge_bits in proptest::collection::vec(any::<bool>(), 25),
+            seed in 0usize..5,
+            damping in prop_oneof![Just(0.0), Just(0.25), Just(0.85), Just(1.0)],
+            iterations in 0usize..=6,
+        ) {
+            let seed = seed % node_count;
+            let requested = &edge_bits[..node_count * node_count];
+            let (kg, dense) = crate::algo::test_oracles::graph_with_dense_adjacency(
+                node_count,
+                requested,
+            );
+            let mut one_hot = vec![0.0; node_count];
+            one_hot[seed] = 1.0;
+            let expected = crate::algo::test_oracles::dense_walk(
+                &dense,
+                &one_hot,
+                &one_hot,
+                damping,
+                iterations,
+            );
+            let seed_id = format!("n{seed}");
+            let actual = try_personalized_pagerank(
+                &kg,
+                &seed_id,
+                PprConfig {
+                    damping,
+                    max_iterations: iterations,
+                    tolerance: f64::MIN_POSITIVE,
+                },
+            ).unwrap();
+
+            for (index, expected_score) in expected.into_iter().enumerate() {
+                let id = format!("n{index}");
+                prop_assert!(
+                    (actual.scores[id.as_str()] - expected_score).abs() < 1e-12,
+                    "node={id} actual={} expected={expected_score}",
+                    actual.scores[id.as_str()],
+                );
+            }
+        }
     }
 }

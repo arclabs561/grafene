@@ -102,15 +102,8 @@ pub fn try_pagerank(
         });
     }
 
-    let adjacency: Vec<Vec<_>> = graph
-        .node_indices()
-        .map(|idx| {
-            crate::algo::unique_neighbors_directed(graph, idx, petgraph::Direction::Outgoing)
-                .into_iter()
-                .map(|n| n.index())
-                .collect()
-        })
-        .collect();
+    let adjacency = crate::algo::DedupAdjacency::directed(graph, petgraph::Direction::Outgoing);
+    let adjacency = adjacency.rows();
 
     let n_f = n as f64;
     let damping = config.damping_factor;
@@ -173,6 +166,7 @@ pub fn try_pagerank(
 mod tests {
     use super::*;
     use crate::Triple;
+    use proptest::prelude::*;
 
     #[test]
     fn test_pagerank_cycle() {
@@ -307,5 +301,46 @@ mod tests {
         assert!(!result.converged);
         assert!((result.scores["A"] - 0.375).abs() < 1e-15);
         assert!((result.scores["B"] - 0.625).abs() < 1e-15);
+    }
+
+    proptest! {
+        #[test]
+        fn pagerank_matches_independent_dense_transition(
+            node_count in 2usize..=5,
+            edge_bits in proptest::collection::vec(any::<bool>(), 25),
+            damping in prop_oneof![Just(0.0), Just(0.25), Just(0.85), Just(1.0)],
+            iterations in 0usize..=6,
+        ) {
+            let requested = &edge_bits[..node_count * node_count];
+            let (kg, dense) = crate::algo::test_oracles::graph_with_dense_adjacency(
+                node_count,
+                requested,
+            );
+            let uniform = vec![1.0 / node_count as f64; node_count];
+            let expected = crate::algo::test_oracles::dense_walk(
+                &dense,
+                &uniform,
+                &uniform,
+                damping,
+                iterations,
+            );
+            let actual = try_pagerank(
+                &kg,
+                PageRankConfig {
+                    damping_factor: damping,
+                    max_iterations: iterations,
+                    tolerance: f64::MIN_POSITIVE,
+                },
+            ).unwrap();
+
+            for (index, expected_score) in expected.into_iter().enumerate() {
+                let id = format!("n{index}");
+                prop_assert!(
+                    (actual.scores[id.as_str()] - expected_score).abs() < 1e-12,
+                    "node={id} actual={} expected={expected_score}",
+                    actual.scores[id.as_str()],
+                );
+            }
+        }
     }
 }
